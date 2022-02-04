@@ -3,12 +3,13 @@
 pragma solidity ^0.8.10;
 
 import '@openzeppelin/contracts/access/Ownable.sol';
+import '@openzeppelin/contracts/security/ReentrancyGuard.sol';
 import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 
 import './ValleySwapToken.sol';
 
-contract ValleySwapFarm is Ownable {
+contract ValleySwapFarm is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // Info of each user.
@@ -23,7 +24,7 @@ contract ValleySwapFarm is Ownable {
         IERC20 lpToken;       // Address of LP token contract.
         uint allocPoint;      // How many allocation points assigned to this pool. VS to distribute per block.
         uint lastRewardTime;  // Last timestamp that VS distribution occurs.
-        uint accVSPerStake;   // Accumulated VS per share, times 1e12. See below.
+        uint accVSPerStake;   // Accumulated VS per share, times 1e18. See below.
         uint16 depositFeeBP;  // Deposit fee in basis points
     }
 
@@ -50,6 +51,11 @@ contract ValleySwapFarm is Ownable {
     // The timestamp when VS mining starts.
     uint public startTime;
 
+    event Add(uint indexed pid, IERC20 lpToken, uint allocPoint, uint16 depositFeeBP);
+    event Set(uint indexed pid, uint allocPoint, uint16 depositFeeBP);
+    event SetVsPerSecond(uint newVsPerSecond);
+    event SetDevAddress(address indexed newDevAddress);
+    event SetFeeAddress(address indexed newFeeAddress);
     event Deposit(address indexed user, uint indexed pid, uint amount);
     event Withdraw(address indexed user, uint indexed pid, uint amount);
     event Reinvest(address indexed user, uint indexed pid, uint amount);
@@ -85,6 +91,8 @@ contract ValleySwapFarm is Ownable {
             depositFeeBP: 0
         }));
         totalAllocPoint += reinvestAllocPoint;
+
+        emit Add(0, vs, reinvestAllocPoint, 0);
     }
 
     function poolLength() external view returns (uint) {
@@ -92,10 +100,14 @@ contract ValleySwapFarm is Ownable {
     }
 
     // Add a new lp to the pool. Can only be called by the owner.
-    function add(IERC20 lpToken, uint allocPoint, uint16 depositFeeBP, bool withUpdate, uint position) public onlyOwner {
+    function add(IERC20 lpToken, uint allocPoint, uint16 depositFeeBP, bool withUpdate, uint position) external onlyOwner {
         require(!tokens[lpToken], 'add: token already added');
+        require(depositFeeBP <= 500, 'add: maximum deposit fee is 500 (5%)');
+
+        // strictly check pool position for in case of mass initial adding
         require(poolInfo.length == position, 'add: position check failed');
-        require(depositFeeBP <= 10000, 'add: invalid deposit fee basis points');
+
+        lpToken.balanceOf(address(this));
 
         if (withUpdate) {
             massUpdatePools();
@@ -112,11 +124,13 @@ contract ValleySwapFarm is Ownable {
             depositFeeBP: depositFeeBP
         }));
         tokens[lpToken] = true;
+
+        emit Add(position, lpToken, allocPoint, depositFeeBP);
     }
 
     // Update the given pool's VS allocation point and deposit fee. Can only be called by the owner.
-    function set(uint pid, uint allocPoint, uint16 depositFeeBP, bool withUpdate) public onlyOwner {
-        require(depositFeeBP <= 10000, 'set: invalid deposit fee basis points');
+    function set(uint pid, uint allocPoint, uint16 depositFeeBP, bool withUpdate) external onlyOwner {
+        require(depositFeeBP <= 500, 'set: maximum deposit fee is 500 (5%)');
 
         if (withUpdate) {
             massUpdatePools();
@@ -125,10 +139,33 @@ contract ValleySwapFarm is Ownable {
         totalAllocPoint = totalAllocPoint - poolInfo[pid].allocPoint + allocPoint;
         poolInfo[pid].allocPoint = allocPoint;
         poolInfo[pid].depositFeeBP = depositFeeBP;
+
+        emit Set(pid, allocPoint, depositFeeBP);
     }
 
-    function setVsPerSecond(uint _vsPerSecond) public onlyOwner {
-        vsPerSecond = _vsPerSecond;
+    function setVsPerSecond(uint newVsPerSecond, bool withUpdate) external onlyOwner {
+        require(vsPerSecond <= 5 ether, 'setVsPerSecond: maximum vs per second is 5');
+
+        if (withUpdate) {
+            massUpdatePools();
+        }
+
+        vsPerSecond = newVsPerSecond;
+        emit SetVsPerSecond(newVsPerSecond);
+    }
+
+    function setDevAddress(address newDevAddress) external {
+        require(msg.sender == devAddress, 'setDevAddress: FORBIDDEN');
+        require(newDevAddress != address(0), 'setDevAddress: new dev address cant be 0');
+        devAddress = newDevAddress;
+        emit SetDevAddress(newDevAddress);
+    }
+
+    function setFeeAddress(address newFeeAddress) external {
+        require(msg.sender == feeAddress, 'setFeeAddress: FORBIDDEN');
+        require(newFeeAddress != address(0), 'setDevAddress: new fee address cant be 0');
+        feeAddress = newFeeAddress;
+        emit SetFeeAddress(newFeeAddress);
     }
 
     // View function to see pending VS on frontend.
@@ -144,14 +181,14 @@ contract ValleySwapFarm is Ownable {
       if (block.timestamp > pool.lastRewardTime && pool.totalStake > 0) {
           uint sec = block.timestamp - pool.lastRewardTime;
           uint vsReward = sec * vsPerSecond * pool.allocPoint / totalAllocPoint;
-          accVSPerStake += vsReward * 1e12 / pool.totalStake;
+          accVSPerStake += vsReward * 1e18 / pool.totalStake;
       }
 
-      return user.amount * accVSPerStake / 1e12 - user.rewardDebt;
+      return user.amount * accVSPerStake / 1e18 - user.rewardDebt;
     }
 
     // Deposit LP tokens to MasterChef for VS allocation.
-    function deposit(uint pid, uint amount) external {
+    function deposit(uint pid, uint amount) external nonReentrant {
         PoolInfo storage pool = poolInfo[pid];
         UserInfo storage user = userInfo[pid][msg.sender];
 
@@ -159,25 +196,26 @@ contract ValleySwapFarm is Ownable {
         claim(pid);
 
         if (amount > 0) {
-            pool.lpToken.safeTransferFrom(address(msg.sender), address(this), amount);
+            uint balance = pool.lpToken.balanceOf(address(this));
+            pool.lpToken.safeTransferFrom(msg.sender, address(this), amount);
+            amount = pool.lpToken.balanceOf(address(this)) - balance;
 
             if (pool.depositFeeBP > 0){
                 uint depositFee = amount * pool.depositFeeBP / 10000;
                 pool.lpToken.safeTransfer(feeAddress, depositFee);
-                user.amount += amount - depositFee;
-            } else {
-                user.amount += amount;
+                amount -= depositFee;
             }
+            user.amount += amount;
+            pool.totalStake += amount;
+
+            emit Deposit(msg.sender, pid, amount);
         }
 
-        pool.totalStake += user.amount;
-        user.rewardDebt = user.amount * pool.accVSPerStake / 1e12;
-
-        emit Deposit(msg.sender, pid, amount);
+        user.rewardDebt = user.amount * pool.accVSPerStake / 1e18;
     }
 
     // Withdraw LP tokens from MasterChef.
-    function withdraw(uint pid, uint amount) external {
+    function withdraw(uint pid, uint amount) external nonReentrant {
         PoolInfo storage pool = poolInfo[pid];
         UserInfo storage user = userInfo[pid][msg.sender];
         require(user.amount >= amount, 'withdraw: not good');
@@ -187,16 +225,16 @@ contract ValleySwapFarm is Ownable {
 
         if (amount > 0) {
             user.amount -= amount;
-            pool.lpToken.safeTransfer(address(msg.sender), amount);
+            pool.lpToken.safeTransfer(msg.sender, amount);
         }
 
         pool.totalStake -= amount;
-        user.rewardDebt = user.amount * pool.accVSPerStake / 1e12;
+        user.rewardDebt = user.amount * pool.accVSPerStake / 1e18;
         emit Withdraw(msg.sender, pid, amount);
     }
 
     // Reinvest LP tokens to Reinvest Pool
-    function reinvest(uint pid) public {
+    function reinvest(uint pid) public nonReentrant {
         PoolInfo storage pool = poolInfo[pid];
         UserInfo storage user = userInfo[pid][msg.sender];
 
@@ -209,7 +247,7 @@ contract ValleySwapFarm is Ownable {
 
         if (pid != 0) {
           reinvest(0);
-          user.rewardDebt = user.amount * pool.accVSPerStake / 1e12;
+          user.rewardDebt = user.amount * pool.accVSPerStake / 1e18;
         }
 
         PoolInfo storage rPool = poolInfo[0];
@@ -217,22 +255,23 @@ contract ValleySwapFarm is Ownable {
 
         rUser.amount += toReinvest;
         rPool.totalStake += toReinvest;
-        rUser.rewardDebt = rUser.amount * rPool.accVSPerStake / 1e12;
+        rUser.rewardDebt = rUser.amount * rPool.accVSPerStake / 1e18;
 
         emit Reinvest(msg.sender, pid, toReinvest);
     }
 
     // Withdraw without caring about rewards. EMERGENCY ONLY.
-    function emergencyWithdraw(uint pid) external {
+    function emergencyWithdraw(uint pid) external nonReentrant {
         PoolInfo storage pool = poolInfo[pid];
         UserInfo storage user = userInfo[pid][msg.sender];
 
-        pool.lpToken.safeTransfer(address(msg.sender), user.amount);
-        emit EmergencyWithdraw(msg.sender, pid, user.amount);
-
-        pool.totalStake -= user.amount;
+        uint amount = user.amount;
+        pool.totalStake -= amount;
         user.amount = 0;
         user.rewardDebt = 0;
+
+        pool.lpToken.safeTransfer(msg.sender, amount);
+        emit EmergencyWithdraw(msg.sender, pid, amount);
     }
 
     // Update reward variables of the given pool to be up-to-date.
@@ -252,7 +291,7 @@ contract ValleySwapFarm is Ownable {
         vs.mint(devAddress, vsReward / 10);
         vs.mint(address(this), vsReward);
 
-        pool.accVSPerStake += vsReward * 1e12 / pool.totalStake;
+        pool.accVSPerStake += vsReward * 1e18 / pool.totalStake;
         pool.lastRewardTime = block.timestamp;
     }
 
@@ -279,16 +318,5 @@ contract ValleySwapFarm is Ownable {
         } else {
             vs.transfer(to, amount);
         }
-    }
-
-    // Update dev address by the previous dev.
-    function setDevAddress(address newDevAddress) public {
-        require(msg.sender == devAddress, 'setDevAddress: FORBIDDEN');
-        devAddress = newDevAddress;
-    }
-
-    function setFeeAddress(address newFeeAddress) public {
-        require(msg.sender == feeAddress, 'setFeeAddress: FORBIDDEN');
-        feeAddress = newFeeAddress;
     }
 }
